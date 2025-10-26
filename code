@@ -1,0 +1,402 @@
+import os.path as osp
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.cuda.amp import GradScaler, autocast
+
+from dassl.engine import TRAINER_REGISTRY, TrainerX
+from dassl.metrics import compute_accuracy
+from dassl.utils import load_pretrained_weights, load_checkpoint
+from dassl.optim import build_optimizer, build_lr_scheduler
+
+from clip import clip
+from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+
+_tokenizer = _Tokenizer()
+
+
+def load_clip_to_cpu(cfg):
+    backbone_name = cfg.MODEL.BACKBONE.NAME
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
+
+    try:
+        # loading JIT archive
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
+
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu")
+
+    model = clip.build_model(state_dict or model.state_dict())
+
+    return model
+
+
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        # 从CLIP模型中提取文本编码器的各个组件
+        self.transformer = clip_model.transformer  # Transformer主干网络
+        self.positional_embedding = clip_model.positional_embedding  # 位置编码
+        self.ln_final = clip_model.ln_final  # 最后的LayerNorm层
+        self.text_projection = clip_model.text_projection  # 文本特征投影层
+        self.dtype = clip_model.dtype  # 模型数据类型（如float16/float32）
+
+    def forward(self, prompts, tokenized_prompts):
+        # 1. 将词嵌入与位置编码相加
+        # prompts: 输入文本的词嵌入 [batch_size, sequence_length, embedding_dim]
+        # positional_embedding: 位置编码 [sequence_length, embedding_dim]
+        x = prompts + self.positional_embedding.type(self.dtype)
+
+        # 2. 调整维度顺序以适应Transformer输入要求
+        # 从 [batch_size, seq_len, hidden_dim] -> [seq_len, batch_size, hidden_dim]
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        # 3. 通过Transformer编码器
+        # 进行多层自注意力计算和前向传播
+        x = self.transformer(x)
+
+        # 4. 恢复原始维度顺序
+        # 从 [seq_len, batch_size, hidden_dim] -> [batch_size, seq_len, hidden_dim]
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        # 5. 应用最后的LayerNorm层并进行类型转换
+        x = self.ln_final(x).type(self.dtype)
+
+        # 此时 x.shape = [batch_size, n_ctx, transformer.width]
+        # batch_size: 批次大小, n_ctx: 序列长度, transformer.width: 隐藏层维度
+
+        # 6. 提取序列结束符(EOS)对应的特征向量
+        # tokenized_prompts.argmax(dim=-1): 找到每个序列中实际文本的结束位置
+        # torch.arange(x.shape[0]): 批次索引 [0, 1, 2, ..., batch_size-1]
+        # x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]:
+        #   对每个样本，取EOS位置对应的隐藏状态
+        eos_embeddings = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+
+        # 7. 通过投影层将特征映射到CLIP的共享嵌入空间
+        # @: 矩阵乘法，将文本特征投影到与图像特征相同的维度
+        x = eos_embeddings @ self.text_projection
+
+        return x  # 返回最终的文本特征 [batch_size, embedding_dim]
+
+
+class PromptLearner(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        n_cls = len(classnames)  # 类别数量
+        n_ctx = cfg.TRAINER.COOP.N_CTX  # 上下文token的数量
+        ctx_init = cfg.TRAINER.COOP.CTX_INIT  # 初始上下文文本（如果有）
+        dtype = clip_model.dtype  # 模型的数据类型
+        ctx_dim = clip_model.ln_final.weight.shape[0]  # 上下文维度（嵌入维度）
+        clip_imsize = clip_model.visual.input_resolution  # CLIP模型的输入图像尺寸
+        cfg_imsize = cfg.INPUT.SIZE[0]  # 配置中的图像尺寸
+        # 确保配置的图像尺寸与CLIP模型要求的尺寸一致
+        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+        # 如果有初始上下文文本，使用给定的词来初始化上下文向量
+        if ctx_init:
+            # use given words to initialize context vectors
+            ctx_init = ctx_init.replace("_", " ")  # 将下划线替换为空格
+            n_ctx = len(ctx_init.split(" "))  # 根据初始文本更新上下文token数量
+            prompt = clip.tokenize(ctx_init)  # 将初始文本token化
+            with torch.no_grad():
+                # 获取初始文本的词嵌入
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            # 提取上下文向量（去掉SOS token）
+            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+            prompt_prefix = ctx_init  # 保存提示前缀
+
+        else:
+            # 随机初始化上下文向量
+            if cfg.TRAINER.COOP.CSC:
+                # 如果是类特定上下文，为每个类别初始化独立的上下文
+                print("Initializing class-specific contexts")
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+            else:
+                # 如果是通用上下文，所有类别共享相同的上下文
+                print("Initializing a generic context")
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            # 使用正态分布初始化上下文向量
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)  # 创建占位符前缀
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        # 将上下文向量设置为可优化的参数
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        # 预处理类别名称：将下划线替换为空格
+        classnames = [name.replace("_", " ") for name in classnames]
+        # 计算每个类别名称的token长度
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        # 构建完整的提示文本：前缀 + 类别名称 + 句号
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+
+        # 将所有提示文本token化
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        with torch.no_grad():
+            # 获取所有提示文本的词嵌入
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        # 注册缓冲区：保存前缀token（SOS token）
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        # 注册缓冲区：保存后缀token（CLS, EOS等）
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+
+        # 保存各种属性
+        self.n_cls = n_cls  # 类别数量
+        self.n_ctx = n_ctx  # 上下文token数量
+        self.tokenized_prompts = tokenized_prompts  # token化的提示文本
+        self.name_lens = name_lens  # 类别名称的token长度
+        self.class_token_position = cfg.TRAINER.COOP.CLASS_TOKEN_POSITION  # 类别token位置
+
+    def forward(self):
+        ctx = self.ctx  # 获取可学习的上下文向量
+
+        # 如果ctx是2维的（通用上下文），扩展为3维以匹配类别数量
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix  # 前缀token嵌入
+        suffix = self.token_suffix  # 后缀token嵌入
+
+        # 根据类别token的位置构建不同的提示
+        if self.class_token_position == "end":
+            # 类别token在最后：prefix + ctx + class + suffix
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim) - SOS token
+                    ctx,  # (n_cls, n_ctx, dim) - 可学习的上下文
+                    suffix,  # (n_cls, *, dim) - 类别名称和EOS等
+                ],
+                dim=1,
+            )
+
+        elif self.class_token_position == "middle":
+            # 类别token在中间：prefix + ctx前半部分 + class + ctx后半部分 + suffix
+            half_n_ctx = self.n_ctx // 2  # 上下文token数量的一半
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]  # 当前类别名称的token长度
+                prefix_i = prefix[i: i + 1, :, :]  # 当前类别的前缀
+                class_i = suffix[i: i + 1, :name_len, :]  # 当前类别名称的嵌入
+                suffix_i = suffix[i: i + 1, name_len:, :]  # 剩余的后缀
+                ctx_i_half1 = ctx[i: i + 1, :half_n_ctx, :]  # 上下文前半部分
+                ctx_i_half2 = ctx[i: i + 1, half_n_ctx:, :]  # 上下文后半部分
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim) - SOS
+                        ctx_i_half1,  # (1, n_ctx//2, dim) - 前半上下文
+                        class_i,  # (1, name_len, dim) - 类别名称
+                        ctx_i_half2,  # (1, n_ctx//2, dim) - 后半上下文
+                        suffix_i,  # (1, *, dim) - 剩余后缀
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)  # 合并所有类别的提示
+
+        elif self.class_token_position == "front":
+            # 类别token在最前面：prefix + class + ctx + suffix
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]  # 当前类别名称的token长度
+                prefix_i = prefix[i: i + 1, :, :]  # 当前类别的前缀
+                class_i = suffix[i: i + 1, :name_len, :]  # 当前类别名称的嵌入
+                suffix_i = suffix[i: i + 1, name_len:, :]  # 剩余的后缀
+                ctx_i = ctx[i: i + 1, :, :]  # 当前类别的上下文
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim) - SOS
+                        class_i,  # (1, name_len, dim) - 类别名称
+                        ctx_i,  # (1, n_ctx, dim) - 可学习的上下文
+                        suffix_i,  # (1, *, dim) - 剩余后缀
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)  # 合并所有类别的提示
+
+        else:
+            raise ValueError  # 无效的类别token位置
+
+        return prompts  # 返回构建的提示嵌入
+
+
+class CustomCLIP(nn.Module):
+    def __init__(self, cfg, classnames, clip_model):
+        super().__init__()
+        # 初始化提示学习器，用于学习优化的提示文本
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        # 保存token化的提示文本（用于文本编码器）
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        # 使用CLIP的图像编码器（视觉 backbone）
+        self.image_encoder = clip_model.visual
+        # 使用自定义的文本编码器（之前分析过的TextEncoder）
+        self.text_encoder = TextEncoder(clip_model)
+        # 从原始CLIP模型获取logit缩放参数（温度参数）
+        self.logit_scale = clip_model.logit_scale
+        # 保存模型的数据类型（如float16/float32）
+        self.dtype = clip_model.dtype
+
+    def forward(self, image):
+        # 1. 提取图像特征
+        # 输入: image [batch_size, 3, H, W]
+        # 输出: image_features [batch_size, embedding_dim]
+        image_features = self.image_encoder(image.type(self.dtype))
+
+        # 2. 获取学习到的提示嵌入
+        # prompts: [n_cls, seq_len, embedding_dim]
+        # 例如对于3个类别: [3, 8, 512]
+        prompts = self.prompt_learner()
+
+        # 3. 获取token化的提示文本（用于确定EOS位置）
+        tokenized_prompts = self.tokenized_prompts
+
+        # 4. 使用文本编码器提取文本特征
+        # 输入: prompts [n_cls, seq_len, embedding_dim], tokenized_prompts [n_cls, seq_len]
+        # 输出: text_features [n_cls, embedding_dim]
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+
+        # 5. 对图像特征进行L2归一化
+        # 将特征向量归一化为单位向量，便于计算余弦相似度
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        # 6. 对文本特征进行L2归一化
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # 7. 获取logit缩放因子（温度参数）
+        # logit_scale是可学习参数，用于控制相似度的缩放
+        logit_scale = self.logit_scale.exp()
+
+        # 8. 计算图像-文本相似度（logits）
+        # image_features: [batch_size, embedding_dim]
+        # text_features: [n_cls, embedding_dim]
+        # 矩阵乘法结果: [batch_size, n_cls]
+        # 然后乘以logit_scale进行缩放
+        logits = logit_scale * image_features @ text_features.t()
+
+        return logits
+
+
+@TRAINER_REGISTRY.register()
+class CoOp(TrainerX):
+    """Context Optimization (CoOp).
+
+    Learning to Prompt for Vision-Language Models
+    https://arxiv.org/abs/2109.01134
+    """
+
+    def check_cfg(self, cfg):
+        assert cfg.TRAINER.COOP.PREC in ["fp16", "fp32", "amp"]
+
+    def build_model(self):
+        cfg = self.cfg
+        classnames = self.dm.dataset.classnames
+
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        clip_model = load_clip_to_cpu(cfg)
+        
+        if cfg.TRAINER.COOP.PREC == "fp32" or cfg.TRAINER.COOP.PREC == "amp":
+            # CLIP's default precision is fp16
+            clip_model.float()
+
+        print("Building custom CLIP")
+        self.model = CustomCLIP(cfg, classnames, clip_model)
+
+        print("Turning off gradients in both the image and the text encoder")
+        for name, param in self.model.named_parameters():
+            if "prompt_learner" not in name:
+                param.requires_grad_(False)
+
+        if cfg.MODEL.INIT_WEIGHTS:
+            load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
+
+        self.model.to(self.device)
+        # NOTE: only give prompt_learner to the optimizer
+        self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+
+        self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
+
+        # Note that multi-gpu training could be slow because CLIP's size is
+        # big, which slows down the copy operation in DataParallel
+        device_count = torch.cuda.device_count()
+        if device_count > 1:
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+            self.model = nn.DataParallel(self.model)
+
+    def forward_backward(self, batch):
+        image, label = self.parse_batch_train(batch)
+        
+        prec = self.cfg.TRAINER.COOP.PREC
+        if prec == "amp":
+            with autocast():
+                output = self.model(image)
+                loss = F.cross_entropy(output, label)
+            self.optim.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optim)
+            self.scaler.update()
+        else:
+            output = self.model(image)
+            loss = F.cross_entropy(output, label)
+            self.model_backward_and_update(loss)
+
+        loss_summary = {
+            "loss": loss.item(),
+            "acc": compute_accuracy(output, label)[0].item(),
+        }
+
+        if (self.batch_idx + 1) == self.num_batches:
+            self.update_lr()
+
+        return loss_summary
+
+    def parse_batch_train(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+        input = input.to(self.device)
+        label = label.to(self.device)
+        return input, label
+
+    def load_model(self, directory, epoch=None):
+        if not directory:
+            print("Note that load_model() is skipped as no pretrained model is given")
+            return
+
+        names = self.get_model_names()
+
+        # By default, the best model is loaded
+        model_file = "model-best.pth.tar"
+
+        if epoch is not None:
+            model_file = "model.pth.tar-" + str(epoch)
+
+        for name in names:
+            model_path = osp.join(directory, name, model_file)
+
+            if not osp.exists(model_path):
+                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
+
+            checkpoint = load_checkpoint(model_path)
+            state_dict = checkpoint["state_dict"]
+            epoch = checkpoint["epoch"]
+
+            # Ignore fixed token vectors
+            if "token_prefix" in state_dict:
+                del state_dict["token_prefix"]
+
+            if "token_suffix" in state_dict:
+                del state_dict["token_suffix"]
+
+            print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            # set strict=False
+            self._models[name].load_state_dict(state_dict, strict=False)
